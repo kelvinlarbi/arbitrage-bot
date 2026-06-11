@@ -25,21 +25,9 @@ class MarketRow:
     sb_outcome1: str=""; sb_odds1: float=0; sb_outcome2: str=""; sb_odds2: float=0
     st_outcome1: str=""; st_odds1: float=0; st_outcome2: str=""; st_odds2: float=0
 
-# ── Stake session (curl_cffi mimics browser TLS fingerprint) ──
+# ── Stake fetch (multi-strategy) ─────────────────────
 
-IMPORT_ERR = None
-try:
-    from curl_cffi import requests as cr
-    stake_session = cr.Session(impersonate="chrome120")
-except Exception as e:
-    IMPORT_ERR = e
-    try:
-        import cloudscraper
-        stake_session = cloudscraper.create_scraper()
-    except ImportError:
-        stake_session = requests.Session()
-
-stake_session.headers.update({
+STAKE_HEADERS = {
     "Content-Type": "application/json",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
     "Referer": "https://stake.com/sports/basketball",
@@ -47,20 +35,43 @@ stake_session.headers.update({
     "x-language": "en",
     "Accept": "application/json",
     "Accept-Language": "en-US,en;q=0.9",
-})
+}
 
-def init_stake_session():
+def stake_graphql(payload: dict, timeout=15):
+    """Try to call Stake GraphQL via multiple strategies."""
+    # Strategy 1: plain requests, no session
     try:
-        log.info("Initializing Stake session...")
-        r = stake_session.get("https://stake.com/sports/basketball", timeout=20)
-        log.info(f"Stake init: {r.status_code}")
+        r = requests.post("https://stake.com/_api/graphql", json=payload, headers=STAKE_HEADERS, timeout=timeout)
+        if r.status_code == 200: return r.json()
+        if r.status_code != 403: log.warning(f"Stake strategy-1: {r.status_code}")
     except Exception as e:
-        log.warning(f"Stake session init error: {e}")
-        log.info("Initializing Stake session...")
-        r = stake_session.get("https://stake.com/sports/basketball", timeout=20)
-        log.info(f"Stake init: {r.status_code}")
-    except Exception as e:
-        log.warning(f"Stake session init error: {e}")
+        log.warning(f"Stake strategy-1 error: {e}")
+
+    # Strategy 2: plain requests session with init
+    try:
+        s = requests.Session()
+        s.headers.update(STAKE_HEADERS)
+        s.get("https://stake.com/sports/basketball", timeout=timeout)
+        r = s.post("https://stake.com/_api/graphql", json=payload, timeout=timeout)
+        if r.status_code == 200: return r.json()
+    except Exception:
+        pass
+
+    # Strategy 3: curl_cffi
+    try:
+        from curl_cffi import requests as cr
+        for fp in ("chrome120", "safari17_0"):
+            try:
+                s = cr.Session(impersonate=fp)
+                s.headers.update(STAKE_HEADERS)
+                r = s.post("https://stake.com/_api/graphql", json=payload, headers={"Content-Type": "application/json"}, timeout=timeout)
+                if r.status_code == 200: return r.json()
+            except Exception:
+                continue
+    except ImportError:
+        pass
+
+    return None
 
 # ── SportyBet fetch ──────────────────────────────────
 
@@ -146,55 +157,49 @@ def fetch_stake():
     payload = {"query": QUERY, "variables": {"sport": "basketball", "type": "upcoming", "groups": "main", "tournamentLimit": 25, "fixtureCountLimit": 20}}
 
     for attempt in range(3):
-        try:
-            r = stake_session.post("https://stake.com/_api/graphql", json=payload, timeout=15)
-            log.info(f"Stake status: {r.status_code} length: {len(r.text)}")
-            if r.status_code == 200 and len(r.text) > 100:
-                data = r.json()
-                games = {}
-                for tournament in data.get("data", {}).get("slugSport", {}).get("tournamentList", []):
-                    for fixture in tournament.get("fixtureList", []):
-                        competitors = fixture.get("data", {}).get("competitors", [])
-                        if len(competitors) < 2: continue
-                        home, away = competitors[0]["name"], competitors[1]["name"]
-                        base_key = f"{home.lower().strip()} vs {away.lower().strip()}"
+        data = stake_graphql(payload)
+        if data:
+            games = {}
+            for tournament in data.get("data", {}).get("slugSport", {}).get("tournamentList", []):
+                for fixture in tournament.get("fixtureList", []):
+                    competitors = fixture.get("data", {}).get("competitors", [])
+                    if len(competitors) < 2: continue
+                    home, away = competitors[0]["name"], competitors[1]["name"]
+                    base_key = f"{home.lower().strip()} vs {away.lower().strip()}"
 
-                        for group in fixture.get("groups", []):
-                            for template in group.get("templates", []):
-                                for market in template.get("markets", []):
-                                    mn = market.get("name", "")
-                                    outcomes = market.get("outcomes", [])
-                                    if market.get("status") != "active" or len(outcomes) != 2: continue
-                                    sp = market.get("specifiers", "")
+                    for group in fixture.get("groups", []):
+                        for template in group.get("templates", []):
+                            for market in template.get("markets", []):
+                                mn = market.get("name", "")
+                                outcomes = market.get("outcomes", [])
+                                if market.get("status") != "active" or len(outcomes) != 2: continue
+                                sp = market.get("specifiers", "")
 
-                                    if mn == "Winner (Incl. Overtime)":
-                                        key = f"{base_key}|winner"
-                                        games[key] = {"home": home, "away": away, "market": "Winner",
-                                            "o1n": outcomes[0]["name"], "o2n": outcomes[1]["name"],
-                                            "o1o": float(outcomes[0]["odds"]), "o2o": float(outcomes[1]["odds"]),
-                                            "source": "Stake"}
+                                if mn == "Winner (Incl. Overtime)":
+                                    key = f"{base_key}|winner"
+                                    games[key] = {"home": home, "away": away, "market": "Winner",
+                                        "o1n": outcomes[0]["name"], "o2n": outcomes[1]["name"],
+                                        "o1o": float(outcomes[0]["odds"]), "o2o": float(outcomes[1]["odds"]),
+                                        "source": "Stake"}
 
-                                    if "over/under" in mn.lower() or "total" in mn.lower():
-                                        key = f"{base_key}|ou|{mn.lower()}"
-                                        games[key] = {"home": home, "away": away, "market": f"O/U {sp}",
-                                            "o1n": outcomes[0]["name"], "o2n": outcomes[1]["name"],
-                                            "o1o": float(outcomes[0]["odds"]), "o2o": float(outcomes[1]["odds"]),
-                                            "source": "Stake"}
+                                if "over/under" in mn.lower() or "total" in mn.lower():
+                                    key = f"{base_key}|ou|{mn.lower()}"
+                                    games[key] = {"home": home, "away": away, "market": f"O/U {sp}",
+                                        "o1n": outcomes[0]["name"], "o2n": outcomes[1]["name"],
+                                        "o1o": float(outcomes[0]["odds"]), "o2o": float(outcomes[1]["odds"]),
+                                        "source": "Stake"}
 
-                                    if "handicap" in mn.lower():
-                                        key = f"{base_key}|hcp|{mn.lower()}"
-                                        games[key] = {"home": home, "away": away, "market": f"HCP {sp}",
-                                            "o1n": outcomes[0]["name"], "o2n": outcomes[1]["name"],
-                                            "o1o": float(outcomes[0]["odds"]), "o2o": float(outcomes[1]["odds"]),
-                                            "source": "Stake"}
+                                if "handicap" in mn.lower():
+                                    key = f"{base_key}|hcp|{mn.lower()}"
+                                    games[key] = {"home": home, "away": away, "market": f"HCP {sp}",
+                                        "o1n": outcomes[0]["name"], "o2n": outcomes[1]["name"],
+                                        "o1o": float(outcomes[0]["odds"]), "o2o": float(outcomes[1]["odds"]),
+                                        "source": "Stake"}
 
-                log.info(f"Stake: {len(games)} markets")
-                return games
-            log.warning(f"Stake attempt {attempt+1} failed, reinit...")
-            init_stake_session()
-            time.sleep(5)
-        except Exception as e:
-            log.warning(f"Stake error: {e}"), time.sleep(5)
+            log.info(f"Stake: {len(games)} markets")
+            return games
+        log.warning(f"Stake attempt {attempt+1} failed, retrying...")
+        time.sleep(3)
     log.error("Stake failed after 3 attempts")
     return {}
 
@@ -292,14 +297,19 @@ def build_xlsx(rows: list[MarketRow]) -> BytesIO:
 # ── Telegram ─────────────────────────────────────────
 
 TG_OK = True
+TG_MAX = 4000
 
 def tg_send_msg(token: str, chat_id: str, text: str):
     global TG_OK
     try:
-        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=15)
-        if r.status_code != 200: log.warning(f"Telegram msg error: {r.text}")
-        else: log.info("Telegram message sent")
+        chunks = [text[i:i+TG_MAX] for i in range(0, len(text), TG_MAX)] if len(text) > TG_MAX else [text]
+        for chunk in chunks:
+            r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": chunk, "parse_mode": "HTML"}, timeout=15)
+            if r.status_code != 200:
+                log.warning(f"Telegram msg error: {r.text}")
+                return
+        log.info(f"Telegram message sent ({len(chunks)} chunk{'s' if len(chunks)>1 else ''})")
     except Exception as e:
         log.warning(f"Telegram unreachable (msg): {e}")
         TG_OK = False
@@ -451,7 +461,6 @@ def bot_listen(tg_token: str, tg_chat: str):
     log.info("Interactive bot mode started")
     log.info(f"Bot: @{tg_token.split(':')[0]}")
 
-    init_stake_session()
     bot_refresh()
     last_update = 0
 
@@ -544,15 +553,12 @@ def main():
         return
 
     if args.daemon:
-        init_stake_session()
         daemon_loop(args.tg_token, args.tg_chat, args.daemon)
     elif args.once:
-        init_stake_session()
         run_once(args.tg_token, args.tg_chat)
     elif args.bot:
         bot_listen(args.tg_token, args.tg_chat)
     else:
-        init_stake_session()
         rows = fetch_odds()
         if not rows: print("No data."); return
         buf, arb_count = build_xlsx(rows)
