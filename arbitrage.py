@@ -276,7 +276,12 @@ def run_once(api_key: str, tg_token: str, tg_chat: str) -> bool:
 
 def daemon_loop(api_key: str, tg_token: str, tg_chat: str, interval: int):
     log.info(f"Daemon mode: every {interval}min")
+    log.info(f"Telegram: {'configured' if tg_token and tg_chat else 'NOT configured'}")
+    log.info(f"API key: {'set' if api_key else 'NOT set'}")
+    cycle = 0
     while True:
+        cycle += 1
+        log.info(f"[Cycle {cycle}] Starting fetch...")
         try:
             run_once(api_key, tg_token, tg_chat)
         except RateLimitExceeded:
@@ -285,12 +290,13 @@ def daemon_loop(api_key: str, tg_token: str, tg_chat: str, interval: int):
             continue
         except Exception as e:
             log.error(f"Error: {e}")
-        log.info(f"Sleeping {interval}min...")
+        log.info(f"[Cycle {cycle}] Done. Sleeping {interval}min...")
         time.sleep(interval * 60)
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
+    global TG_OK
     import argparse
     ap = argparse.ArgumentParser(description="Basketball odds: SportyBet vs Stake -> Excel + Telegram")
     ap.add_argument("--api-key", default=API_KEY)
@@ -299,7 +305,19 @@ def main():
     ap.add_argument("--sample", action="store_true", help="Demo data, no API key")
     ap.add_argument("--daemon", type=int, default=0, metavar="MIN", help="Run on loop every N minutes")
     ap.add_argument("--once", action="store_true", help="Run once, send to Telegram if configured")
+    ap.add_argument("--test-tg", action="store_true", help="Test Telegram bot connection")
     args = ap.parse_args()
+
+    if args.test_tg:
+        if not args.tg_token:
+            print("No TG_TOKEN configured."); return
+        TG_OK = True
+        tg_send_msg(args.tg_token, args.tg_chat, "Test message - Bot is working.")
+        if TG_OK:
+            print("OK: Telegram message sent. Check your Telegram.")
+        else:
+            print("FAIL: Could not reach Telegram. Check network/firewall.")
+        return
 
     if args.sample:
         rows = sample_data()
@@ -307,7 +325,6 @@ def main():
         arbs = find_arbs(rows)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        global TG_OK
         TG_OK = True
         if args.tg_token and args.tg_chat:
             tg_send_msg(args.tg_token, args.tg_chat, build_summary(rows, arbs))
