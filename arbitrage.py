@@ -293,7 +293,129 @@ def daemon_loop(api_key: str, tg_token: str, tg_chat: str, interval: int):
         log.info(f"[Cycle {cycle}] Done. Sleeping {interval}min...")
         time.sleep(interval * 60)
 
-# ── CLI ──────────────────────────────────────────────────────────────────────
+# ── Interactive Bot Mode ─────────────────────────────────────────────────────
+
+CACHE = {"rows": [], "arbs": [], "updated": ""}
+
+def bot_format_games(rows: list[MarketRow]) -> str:
+    if not rows: return "No games available."
+    lines = ["<b>Available Games</b>\n"]
+    seen = {}
+    for r in rows:
+        key = (r.event_id, r.market_name)
+        if key in seen: continue
+        seen[key] = True
+        sb = f"{r.sb_outcome1} @ {r.sb_odds1}" if r.sb_odds1 else "-"
+        st = f"{r.st_outcome1} @ {r.st_odds1}" if r.st_odds1 else "-"
+        lines.append(f"<b>{r.home} vs {r.away}</b> ({r.league})")
+        lines.append(f"  {r.market_name} ({r.line})")
+        lines.append(f"  SportyBet: {sb}  |  {r.sb_outcome2} @ {r.sb_odds2}")
+        lines.append(f"  Stake:    {st}  |  {r.st_outcome2} @ {r.st_odds2}")
+        lines.append("")
+    return "\n".join(lines)
+
+def bot_format_bookmaker(rows: list[MarketRow], bookmaker: str) -> str:
+    tag = "SportyBet" if "sporty" in bookmaker.lower() else "Stake"
+    lines = [f"<b>{tag} Odds</b>\n"]
+    for r in rows:
+        if tag == "SportyBet":
+            o1, o2 = r.sb_outcome1, r.sb_odds1
+            o3, o4 = r.sb_outcome2, r.sb_odds2
+        else:
+            o1, o2 = r.st_outcome1, r.st_odds1
+            o3, o4 = r.st_outcome2, r.st_odds2
+        lines.append(f"<b>{r.home} vs {r.away}</b>")
+        lines.append(f"  {r.market_name}: {o1} @ {o2}  |  {o3} @ {o4}")
+    lines.append(f"\n{len(rows)} markets total")
+    return "\n".join(lines)
+
+def bot_format_arbs(arbs: list) -> str:
+    if not arbs: return "No arbitrage opportunities right now."
+    lines = ["<b>Arbitrage Opportunities</b>\n"]
+    bank = 1000.0
+    for r, o1, o2, ip1, ip2 in arbs:
+        pct = round((1/(1/o1[1]+1/o2[1])-1)*100, 2)
+        s1 = round(bank/(1/o1[1]+1/o2[1])/o1[1], 2)
+        s2 = round(bank/(1/o1[1]+1/o2[1])/o2[1], 2)
+        profit = round(bank*(1/(1/o1[1]+1/o2[1])-1), 2)
+        lines.append(f"<b>{r.home} vs {r.away}</b> ({r.market_name})")
+        lines.append(f"  {o1[0]}: {o1[1]} @ {o1[2]}  |  {o2[0]}: {o2[1]} @ {o2[2]}")
+        lines.append(f"  Profit: {pct}% | Stake ${s1}+${s2} = ${profit} profit")
+        lines.append("")
+    return "\n".join(lines)
+
+def bot_refresh(api_key: str) -> str:
+    global CACHE
+    try:
+        rows = fetch_odds(api_key) if api_key else sample_data()
+    except RateLimitExceeded:
+        return "Rate limited. Try again later."
+    if not rows:
+        return "No data returned."
+    arbs = find_arbs(rows)
+    CACHE = {"rows": rows, "arbs": arbs, "updated": datetime.now().strftime("%H:%M:%S")}
+    return f"Refreshed: {len(rows)} markets, {len(arbs)} arbitrage opportunities."
+
+def bot_listen(api_key: str, tg_token: str, tg_chat: str):
+    import requests
+    log.info("Interactive bot mode started")
+    log.info(f"Bot: @{tg_token.split(':')[0]}")
+
+    # Initial fetch
+    bot_refresh(api_key)
+    last_update = 0
+
+    while True:
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{tg_token}/getUpdates",
+                json={"offset": last_update + 1, "timeout": 30}, timeout=35)
+            if r.status_code != 200: time.sleep(5); continue
+            updates = r.json().get("result", [])
+            for u in updates:
+                last_update = u["update_id"]
+                msg = u.get("message", {})
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+                text = (msg.get("text") or "").strip().lower()
+
+                if not chat_id or not text:
+                    continue
+
+                # Responses
+                if text == "/start":
+                    tg_send_msg(tg_token, chat_id,
+                        "<b>Basketball Arbitrage Bot</b>\n\n"
+                        "Commands:\n"
+                        "/games - all games with odds\n"
+                        "/sportybet - SportyBet odds only\n"
+                        "/stake - Stake odds only\n"
+                        "/arb - arbitrage opportunities\n"
+                        "/refresh - fetch latest odds\n"
+                        "/help - this message")
+
+                elif text in ("/help", "/start@"):
+                    tg_send_msg(tg_token, chat_id,
+                        "/games - all games\n/sportybet - SportyBet odds\n"
+                        "/stake - Stake odds\n/arb - arbitrage\n/refresh - refresh data")
+
+                elif text == "/refresh":
+                    result = bot_refresh(api_key)
+                    tg_send_msg(tg_token, chat_id, result)
+
+                elif text == "/games":
+                    tg_send_msg(tg_token, chat_id, bot_format_games(CACHE["rows"]))
+
+                elif text in ("/sportybet", "/sporty"):
+                    tg_send_msg(tg_token, chat_id, bot_format_bookmaker(CACHE["rows"], "sportybet"))
+
+                elif text in ("/stake", "/stakecom"):
+                    tg_send_msg(tg_token, chat_id, bot_format_bookmaker(CACHE["rows"], "stake"))
+
+                elif text == "/arb":
+                    tg_send_msg(tg_token, chat_id, bot_format_arbs(CACHE["arbs"]))
+
+        except Exception as e:
+            log.warning(f"Bot loop error: {e}")
+            time.sleep(5)
 
 def main():
     global TG_OK
@@ -303,8 +425,9 @@ def main():
     ap.add_argument("--tg-token", default=TG_TOKEN, help="Telegram bot token")
     ap.add_argument("--tg-chat", default=TG_CHAT_ID, help="Telegram chat ID")
     ap.add_argument("--sample", action="store_true", help="Demo data, no API key")
-    ap.add_argument("--daemon", type=int, default=0, metavar="MIN", help="Run on loop every N minutes")
+    ap.add_argument("--daemon", type=int, default=0, metavar="MIN", help="Push mode: send report every N min")
     ap.add_argument("--once", action="store_true", help="Run once, send to Telegram if configured")
+    ap.add_argument("--bot", action="store_true", help="Interactive bot mode (listens for commands)")
     ap.add_argument("--test-tg", action="store_true", help="Test Telegram bot connection")
     args = ap.parse_args()
 
@@ -342,10 +465,16 @@ def main():
         print("No API key. Use --sample, or set ODDS_API_KEY env var.")
         return
 
+    if not args.tg_token:
+        print("Telegram bot token required for --daemon, --once, or --bot. Set TG_TOKEN.")
+        return
+
     if args.daemon:
         daemon_loop(args.api_key, args.tg_token, args.tg_chat, args.daemon)
     elif args.once:
         run_once(args.api_key, args.tg_token, args.tg_chat)
+    elif args.bot:
+        bot_listen(args.api_key, args.tg_token, args.tg_chat)
     else:
         # Single run, save locally
         try:

@@ -6,7 +6,9 @@
 2. USAGE:
    python arbitrage.py --sample                    # demo spreadsheet
    python arbitrage.py --once                      # one live fetch
-   python arbitrage.py --daemon 30                 # loop every 30min
+   python arbitrage.py --daemon 30                 # push every 30min
+   python arbitrage.py --bot                       # interactive (responds to commands)
+   python arbitrage.py --test-tg                   # test Telegram connection
 
 3. TELEGRAM BOT:
    Create a bot via @BotFather on Telegram, get token + your chat ID.
@@ -22,12 +24,12 @@
      - Push these files to a GitHub repo
      - Go to railway.app -> New Project -> Deploy from GitHub
      - Add env vars: ODDS_API_KEY, TG_TOKEN, TG_CHAT_ID
-     - Start command: python arbitrage.py --daemon 30
+      - Start command: python arbitrage.py --bot
 
    Option B - Render:
-     - Create Web Service from your GitHub repo
-     - Start command: python arbitrage.py --daemon 30
-     - Add env vars in dashboard
+      - Create Web Service from your GitHub repo
+      - Start command: python arbitrage.py --bot
+      - Add env vars in dashboard
 
    Option C - PythonAnywhere:
      - Upload files, create a scheduled task:
