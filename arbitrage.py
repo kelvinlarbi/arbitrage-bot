@@ -25,9 +25,14 @@ class MarketRow:
     sb_outcome1: str=""; sb_odds1: float=0; sb_outcome2: str=""; sb_odds2: float=0
     st_outcome1: str=""; st_odds1: float=0; st_outcome2: str=""; st_odds2: float=0
 
-# ── Stake session ─────────────────────────────────────
+# ── Stake session (cloudscraper bypasses Cloudflare) ──
 
-stake_session = requests.Session()
+try:
+    import cloudscraper
+    stake_session = cloudscraper.create_scraper()
+except ImportError:
+    stake_session = requests.Session()
+
 stake_session.headers.update({
     "Content-Type": "application/json",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
@@ -40,9 +45,9 @@ stake_session.headers.update({
 
 def init_stake_session():
     try:
-        stake_session.cookies.clear()
-        stake_session.get("https://stake.com/sports/basketball", timeout=15)
-        log.info("Stake session initialized")
+        log.info("Initializing Stake session...")
+        r = stake_session.get("https://stake.com/sports/basketball", timeout=20)
+        log.info(f"Stake init: {r.status_code}")
     except Exception as e:
         log.warning(f"Stake session init error: {e}")
 
