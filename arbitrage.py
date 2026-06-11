@@ -1,27 +1,22 @@
 #!/usr/bin/env python3
 """
 Basketball odds: SportyBet vs Stake.com
-Fetches odds via odds-api.io -> Excel -> Telegram bot.
+Scrapes directly from both bookmakers - no API key needed.
 """
 import json, csv, sys, os, time, logging
 from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
+import requests
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger("odds")
-
-API_BASE = "https://api.odds-api.io/v3"
-API_KEY = os.environ.get("ODDS_API_KEY", "61ff4a3c83aeefaf678b4684ab1926f0ac193a56b2cc782e2278934002816289")
-BOOKMAKERS = "SportyBet,Stake"
 
 # Telegram -- set these env vars or pass via CLI
 TG_TOKEN = os.environ.get("TG_TOKEN", "8725819448:AAFaQo5_MXQxRGin3CuTaqVqMmuC0UxlsjI")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "786312246")
 
 # ── Models ───────────────────────────────────────────────────────────────────
-
-class RateLimitExceeded(Exception): pass
 
 @dataclass
 class MarketRow:
@@ -30,90 +25,200 @@ class MarketRow:
     sb_outcome1: str=""; sb_odds1: float=0; sb_outcome2: str=""; sb_odds2: float=0
     st_outcome1: str=""; st_odds1: float=0; st_outcome2: str=""; st_odds2: float=0
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Stake session ─────────────────────────────────────
 
-LABELS = {"home":"Home","away":"Away","draw":"Draw","over":"Over","under":"Under"}
-def l(key): return LABELS.get(key, key.title())
-def fv(v):
-    try: return float(v)
-    except: return 0.0
+stake_session = requests.Session()
+stake_session.headers.update({
+    "Content-Type": "application/json",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    "Referer": "https://stake.com/sports/basketball",
+    "Origin": "https://stake.com",
+    "x-language": "en",
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+})
 
-def _2way(m):
-    out = [(k, fv(v)) for k,v in m.items() if k not in {"hdp"} and fv(v) > 0]
-    return out if len(out) == 2 else None
+def init_stake_session():
+    try:
+        stake_session.cookies.clear()
+        stake_session.get("https://stake.com/sports/basketball", timeout=15)
+        log.info("Stake session initialized")
+    except Exception as e:
+        log.warning(f"Stake session init error: {e}")
 
-# ── API Fetch ────────────────────────────────────────────────────────────────
+# ── SportyBet fetch ──────────────────────────────────
 
-def fetch_odds(api_key: str) -> list[MarketRow]:
-    import requests
-    s = requests.Session()
-    s.headers.update({"User-Agent":"ArbitrageBot/1.0","Accept":"application/json"})
-    bp = {"apiKey": api_key}
-    ratelimited = False
+def fetch_sportybet():
+    URL = "https://www.sportybet.com/api/gh/factsCenter/pcUpcomingEvents?sportId=sr%3Asport%3A2&marketId=219%2C18%2C223%2C1%2C14%2C11&pageSize=100&pageNum=1&option=1"
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json",
+        "Referer": "https://www.sportybet.com/gh/sport/basketball",
+    }
 
-    def get(path, extra=None):
-        nonlocal ratelimited
-        p = {**bp, **(extra or {})}
-        for a in range(3):
-            try:
-                r = s.get(f"{API_BASE}{path}", params=p, timeout=60)
-                if r.status_code == 401: log.error("Invalid API key"); return []
-                if r.status_code == 429:
-                    ratelimited = True
-                    if a < 2: log.warning("Rate limited, waiting 60s..."); time.sleep(60); continue
-                    log.error("Rate limit exceeded."); return []
-                r.raise_for_status(); return r.json()
-            except Exception as e:
-                if a < 2: log.warning(f"Retry {a+1}: {e}"); time.sleep(10)
-                else: log.error(f"Failed: {e}"); return []
-        return []
+    for attempt in range(3):
+        try:
+            r = requests.get(URL, headers=HEADERS, timeout=15)
+            log.info(f"SportyBet status: {r.status_code} length: {len(r.text)}")
+            if r.status_code == 200 and len(r.text) > 100:
+                data = r.json()
+                games = {}
+                for tournament in data.get("data", {}).get("tournaments", []):
+                    for event in tournament.get("events", []):
+                        home = event.get("homeTeamName", "")
+                        away = event.get("awayTeamName", "")
+                        base_key = f"{home.lower().strip()} vs {away.lower().strip()}"
 
-    events = get("/events", {"sport":"basketball","limit":30,"status":"pending"})
-    if not events:
-        if ratelimited: raise RateLimitExceeded()
-        log.error("No pending events"); return []
+                        for market in event.get("markets", []):
+                            market_name = market.get("name", "")
+                            status = market.get("status", 1)
+                            outcomes = market.get("outcomes", [])
+                            if len(outcomes) != 2: continue
+                            d = market.get("desc", "")
 
-    log.info(f"Found {len(events)} events\n")
-    results = []
+                            if market_name == "Winner (incl. overtime)" and status == 0:
+                                key = f"{base_key}|winner"
+                                games[key] = {"home": home, "away": away, "market": "Winner",
+                                    "o1n": outcomes[0]["desc"], "o2n": outcomes[1]["desc"],
+                                    "o1o": float(outcomes[0]["odds"]), "o2o": float(outcomes[1]["odds"]),
+                                    "source": "SportyBet"}
 
-    for i in range(0, len(events), 10):
-        batch = events[i:i+10]
-        ids = [e["id"] for e in batch if e.get("id")]
-        if not ids: continue
+                            elif market_name == "Over/Under" and status == 0 and market.get("farNearOdds") == 1:
+                                key = f"{base_key}|ou|{d.lower()}"
+                                games[key] = {"home": home, "away": away, "market": f"O/U {d}",
+                                    "o1n": outcomes[0]["desc"], "o2n": outcomes[1]["desc"],
+                                    "o1o": float(outcomes[0]["odds"]), "o2o": float(outcomes[1]["odds"]),
+                                    "source": "SportyBet"}
 
-        data = get("/odds/multi", {"eventIds":",".join(str(x) for x in ids),"bookmakers":BOOKMAKERS})
-        if not data: time.sleep(1); continue
+                            elif market_name == "Handicap (incl. overtime)" and status == 0 and market.get("farNearOdds") == 1:
+                                key = f"{base_key}|hcp|{d.lower()}"
+                                games[key] = {"home": home, "away": away, "market": f"HCP {d}",
+                                    "o1n": outcomes[0]["desc"], "o2n": outcomes[1]["desc"],
+                                    "o1o": float(outcomes[0]["odds"]), "o2o": float(outcomes[1]["odds"]),
+                                    "source": "SportyBet"}
 
-        for ev in batch:
-            eid = str(ev.get("id",""))
-            if not eid or eid not in data: continue
-            od = data[eid]
-            if not isinstance(od, dict) or not od.get("bookmakers"): continue
-            bms = od["bookmakers"]
-            if "SportyBet" not in bms or "Stake" not in bms: continue
+                log.info(f"SportyBet: {len(games)} markets")
+                return games
+            log.warning(f"SportyBet attempt {attempt+1} failed, retry...")
+            time.sleep(5)
+        except Exception as e:
+            log.warning(f"SportyBet error: {e}"), time.sleep(5)
+    log.error("SportyBet failed after 3 attempts")
+    return {}
 
-            home, away = od.get("home","?"), od.get("away","?")
-            league = ev.get("league",{}).get("name","?")
-            status = ev.get("status","?")
+# ── Stake fetch ──────────────────────────────────────
 
-            sb = {m["name"]:m for m in bms["SportyBet"]}
-            st = {m["name"]:m for m in bms["Stake"]}
-            cnt = 0
-            for mk in sorted(set(sb.keys()) & set(st.keys())):
-                if mk == "ML": continue
-                so, to = sb[mk].get("odds",[{}])[0], st[mk].get("odds",[{}])[0]
-                p1, p2 = _2way(so), _2way(to)
-                if not p1 or not p2: continue
-                results.append(MarketRow(int(eid), home, away, league, status, mk, str(so.get("hdp","")),
-                    l(p1[0][0]),p1[0][1],l(p1[1][0]),p1[1][1],
-                    l(p2[0][0]),p2[0][1],l(p2[1][0]),p2[1][1]))
-                cnt += 1
-            if cnt: log.info(f"  {home} vs {away} ({league}) - {cnt} markets")
-        time.sleep(0.5)
+def fetch_stake():
+    QUERY = """
+    query SportTournamentFixtureList($sport: String!, $groups: String!, $tournamentLimit: Int = 25, $fixtureCountLimit: Int = 20, $type: SportSearchEnum!) {
+      slugSport(sport: $sport) {
+        tournamentList(type: $type, limit: $tournamentLimit) {
+          name
+          fixtureList(type: $type, limit: $fixtureCountLimit) {
+            name
+            data { ... on SportFixtureDataMatch { competitors { name } } }
+            groups(groups: [$groups], status: [active]) {
+              templates(limit: 10, includeEmpty: false) {
+                markets(limit: 5) { name status specifiers outcomes { name odds active } }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+    payload = {"query": QUERY, "variables": {"sport": "basketball", "type": "upcoming", "groups": "main", "tournamentLimit": 25, "fixtureCountLimit": 20}}
 
-    return results
+    for attempt in range(3):
+        try:
+            r = stake_session.post("https://stake.com/_api/graphql", json=payload, timeout=15)
+            log.info(f"Stake status: {r.status_code} length: {len(r.text)}")
+            if r.status_code == 200 and len(r.text) > 100:
+                data = r.json()
+                games = {}
+                for tournament in data.get("data", {}).get("slugSport", {}).get("tournamentList", []):
+                    for fixture in tournament.get("fixtureList", []):
+                        competitors = fixture.get("data", {}).get("competitors", [])
+                        if len(competitors) < 2: continue
+                        home, away = competitors[0]["name"], competitors[1]["name"]
+                        base_key = f"{home.lower().strip()} vs {away.lower().strip()}"
 
-# ── Excel Export (to memory) ─────────────────────────────────────────────────
+                        for group in fixture.get("groups", []):
+                            for template in group.get("templates", []):
+                                for market in template.get("markets", []):
+                                    mn = market.get("name", "")
+                                    outcomes = market.get("outcomes", [])
+                                    if market.get("status") != "active" or len(outcomes) != 2: continue
+                                    sp = market.get("specifiers", "")
+
+                                    if mn == "Winner (Incl. Overtime)":
+                                        key = f"{base_key}|winner"
+                                        games[key] = {"home": home, "away": away, "market": "Winner",
+                                            "o1n": outcomes[0]["name"], "o2n": outcomes[1]["name"],
+                                            "o1o": float(outcomes[0]["odds"]), "o2o": float(outcomes[1]["odds"]),
+                                            "source": "Stake"}
+
+                                    if "over/under" in mn.lower() or "total" in mn.lower():
+                                        key = f"{base_key}|ou|{mn.lower()}"
+                                        games[key] = {"home": home, "away": away, "market": f"O/U {sp}",
+                                            "o1n": outcomes[0]["name"], "o2n": outcomes[1]["name"],
+                                            "o1o": float(outcomes[0]["odds"]), "o2o": float(outcomes[1]["odds"]),
+                                            "source": "Stake"}
+
+                                    if "handicap" in mn.lower():
+                                        key = f"{base_key}|hcp|{mn.lower()}"
+                                        games[key] = {"home": home, "away": away, "market": f"HCP {sp}",
+                                            "o1n": outcomes[0]["name"], "o2n": outcomes[1]["name"],
+                                            "o1o": float(outcomes[0]["odds"]), "o2o": float(outcomes[1]["odds"]),
+                                            "source": "Stake"}
+
+                log.info(f"Stake: {len(games)} markets")
+                return games
+            log.warning(f"Stake attempt {attempt+1} failed, reinit...")
+            init_stake_session()
+            time.sleep(5)
+        except Exception as e:
+            log.warning(f"Stake error: {e}"), time.sleep(5)
+    log.error("Stake failed after 3 attempts")
+    return {}
+
+# ── Merge both bookmakers into MarketRow list ────────
+
+def fetch_odds() -> list[MarketRow]:
+    sb = fetch_sportybet()
+    st = fetch_stake()
+    all_keys = sorted(set(sb.keys()) | set(st.keys()))
+    rows, eid = [], 0
+    for key in all_keys:
+        s, t = sb.get(key), st.get(key)
+        if not s or not t: continue
+        eid += 1
+        rows.append(MarketRow(eid, s["home"], s["away"], "Basketball", "pending",
+            s["market"], "",
+            s["o1n"], s["o1o"], s["o2n"], s["o2o"],
+            t["o1n"], t["o1o"], t["o2n"], t["o2o"]))
+    log.info(f"Merged: {len(rows)} markets (both bookmakers)")
+    return rows
+
+# ── Arbitrage Finder (works on MarketRow) ────────────
+
+def find_arbs(rows: list[MarketRow]):
+    arbs = []
+    for r in rows:
+        sb = {r.sb_outcome1: r.sb_odds1, r.sb_outcome2: r.sb_odds2}
+        st = {r.st_outcome1: r.st_odds1, r.st_outcome2: r.st_odds2}
+        labs = list(set(list(sb.keys())+list(st.keys())))
+        if len(labs) != 2: continue
+        l1,l2 = labs
+        o1 = max(sb.get(l1,0), st.get(l1,0))
+        o2 = max(sb.get(l2,0), st.get(l2,0))
+        if o1<=0 or o2<=0 or 1/o1+1/o2 >= 1: continue
+        s1 = "SportyBet" if sb.get(l1,0)>=st.get(l1,0) else "Stake"
+        s2 = "SportyBet" if sb.get(l2,0)>=st.get(l2,0) else "Stake"
+        arbs.append((r, (l1,o1,s1), (l2,o2,s2), 1/o1, 1/o2))
+    return arbs
+
+# ── Excel Export ─────────────────────────────────────
 
 def build_xlsx(rows: list[MarketRow]) -> BytesIO:
     from openpyxl import Workbook
@@ -164,29 +269,12 @@ def build_xlsx(rows: list[MarketRow]) -> BytesIO:
     wb.save(buf); buf.seek(0)
     return buf, len(arbs)
 
-def find_arbs(rows: list[MarketRow]):
-    arbs = []
-    for r in rows:
-        sb = {r.sb_outcome1: r.sb_odds1, r.sb_outcome2: r.sb_odds2}
-        st = {r.st_outcome1: r.st_odds1, r.st_outcome2: r.st_odds2}
-        labs = list(set(list(sb.keys())+list(st.keys())))
-        if len(labs) != 2: continue
-        l1,l2 = labs
-        o1 = max(sb.get(l1,0), st.get(l1,0))
-        o2 = max(sb.get(l2,0), st.get(l2,0))
-        if o1<=0 or o2<=0 or 1/o1+1/o2 >= 1: continue
-        s1 = "SportyBet" if sb.get(l1,0)>=st.get(l1,0) else "Stake"
-        s2 = "SportyBet" if sb.get(l2,0)>=st.get(l2,0) else "Stake"
-        arbs.append((r, (l1,o1,s1), (l2,o2,s2), 1/o1, 1/o2))
-    return arbs
-
-# ── Telegram ─────────────────────────────────────────────────────────────────
+# ── Telegram ─────────────────────────────────────────
 
 TG_OK = True
 
 def tg_send_msg(token: str, chat_id: str, text: str):
     global TG_OK
-    import requests
     try:
         r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
             json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=15)
@@ -198,7 +286,6 @@ def tg_send_msg(token: str, chat_id: str, text: str):
 
 def tg_send_file(token: str, chat_id: str, buf: BytesIO, filename: str, caption: str = ""):
     global TG_OK
-    import requests
     try:
         r = requests.post(f"https://api.telegram.org/bot{token}/sendDocument",
             files={"document": (filename, buf.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
@@ -223,31 +310,10 @@ def build_summary(rows: list[MarketRow], arbs: list) -> str:
         lines.append("\nNo arbitrage opportunities found.")
     return "\n".join(lines)
 
-# ── Sample Data ──────────────────────────────────────────────────────────────
+# ── Daemon Mode ──────────────────────────────────────
 
-def sample_data() -> list[MarketRow]:
-    return [
-        MarketRow(1,"Lakers","Celtics","NBA","pending","Spread","5.5",
-            sb_outcome1="Home",sb_odds1=1.91,sb_outcome2="Away",sb_odds2=1.91,
-            st_outcome1="Home",st_odds1=2.00,st_outcome2="Away",st_odds2=1.80),
-        MarketRow(1,"Lakers","Celtics","NBA","pending","Totals","215.5",
-            sb_outcome1="Over",sb_odds1=1.87,sb_outcome2="Under",sb_odds2=1.95,
-            st_outcome1="Over",st_odds1=1.91,st_outcome2="Under",st_odds2=1.91),
-        MarketRow(2,"Bulls","Heat","NBA","pending","Spread","3.5",
-            sb_outcome1="Home",sb_odds1=2.05,sb_outcome2="Away",sb_odds2=1.75,
-            st_outcome1="Home",st_odds1=1.83,st_outcome2="Away",st_odds2=2.00),
-        MarketRow(2,"Bulls","Heat","NBA","pending","Totals","220.5",
-            sb_outcome1="Over",sb_odds1=2.10,sb_outcome2="Under",sb_odds2=1.73,
-            st_outcome1="Over",st_odds1=1.95,st_outcome2="Under",st_odds2=1.87),
-        MarketRow(4,"Bucks","Sixers","NBA","pending","Spread","2.5",
-            sb_outcome1="Home",sb_odds1=2.20,sb_outcome2="Away",sb_odds2=1.65,
-            st_outcome1="Home",st_odds1=1.70,st_outcome2="Away",st_odds2=2.30),
-    ]
-
-# ── Daemon Mode ──────────────────────────────────────────────────────────────
-
-def run_once(api_key: str, tg_token: str, tg_chat: str) -> bool:
-    rows = fetch_odds(api_key)
+def run_once(tg_token: str, tg_chat: str) -> bool:
+    rows = fetch_odds()
     if not rows:
         log.warning("No data fetched")
         return False
@@ -264,41 +330,33 @@ def run_once(api_key: str, tg_token: str, tg_chat: str) -> bool:
         tg_send_msg(tg_token, tg_chat, summary)
         tg_send_file(tg_token, tg_chat, buf, f"basketball_odds_{ts}.xlsx",
                      f"{len(rows)} markets, {arb_count} arbitrage opportunities")
-    # Fallback: save locally if no Telegram or if it failed
     if not tg_token or not tg_chat or not TG_OK:
         with open(f"basketball_odds_{ts}.xlsx", "wb") as f:
             f.write(buf.getvalue())
         log.info(f"Saved locally -> basketball_odds_{ts}.xlsx")
     else:
         log.info("Telegram delivery complete")
-
     return True
 
-def daemon_loop(api_key: str, tg_token: str, tg_chat: str, interval: int):
+def daemon_loop(tg_token: str, tg_chat: str, interval: int):
     log.info(f"Daemon mode: every {interval}min")
     log.info(f"Telegram: {'configured' if tg_token and tg_chat else 'NOT configured'}")
-    log.info(f"API key: {'set' if api_key else 'NOT set'}")
     cycle = 0
     while True:
         cycle += 1
         log.info(f"[Cycle {cycle}] Starting fetch...")
         try:
-            run_once(api_key, tg_token, tg_chat)
-        except RateLimitExceeded:
-            log.warning("Rate limited, waiting 60min...")
-            time.sleep(3600)
-            continue
+            run_once(tg_token, tg_chat)
         except Exception as e:
             log.error(f"Error: {e}")
         log.info(f"[Cycle {cycle}] Done. Sleeping {interval}min...")
         time.sleep(interval * 60)
 
-# ── Interactive Bot Mode ─────────────────────────────────────────────────────
+# ── Interactive Bot Mode ─────────────────────────────
 
 CACHE = {"rows": [], "arbs": [], "updated": ""}
 
 def start_healthcheck():
-    """Minimal HTTP server so Railway healthcheck passes."""
     import http.server, threading
     PORT = int(os.environ.get("PORT", 8080))
     class H(http.server.BaseHTTPRequestHandler):
@@ -321,7 +379,7 @@ def bot_format_games(rows: list[MarketRow]) -> str:
         seen[key] = True
         sb = f"{r.sb_outcome1} @ {r.sb_odds1}" if r.sb_odds1 else "-"
         st = f"{r.st_outcome1} @ {r.st_odds1}" if r.st_odds1 else "-"
-        lines.append(f"<b>{r.home} vs {r.away}</b> ({r.league})")
+        lines.append(f"<b>{r.home} vs {r.away}</b>")
         lines.append(f"  {r.market_name} ({r.line})")
         lines.append(f"  SportyBet: {sb}  |  {r.sb_outcome2} @ {r.sb_odds2}")
         lines.append(f"  Stake:    {st}  |  {r.st_outcome2} @ {r.st_odds2}")
@@ -329,6 +387,7 @@ def bot_format_games(rows: list[MarketRow]) -> str:
     return "\n".join(lines)
 
 def bot_format_bookmaker(rows: list[MarketRow], bookmaker: str) -> str:
+    if not rows: return "No games available right now."
     tag = "SportyBet" if "sporty" in bookmaker.lower() else "Stake"
     lines = [f"<b>{tag} Odds</b>\n"]
     for r in rows:
@@ -358,26 +417,22 @@ def bot_format_arbs(arbs: list) -> str:
         lines.append("")
     return "\n".join(lines)
 
-def bot_refresh(api_key: str) -> str:
+def bot_refresh() -> str:
     global CACHE
-    try:
-        rows = fetch_odds(api_key) if api_key else sample_data()
-    except RateLimitExceeded:
-        return "Rate limited. Try again later."
+    rows = fetch_odds()
+    arbs = find_arbs(rows) if rows else []
+    CACHE = {"rows": rows or [], "arbs": arbs, "updated": datetime.now().strftime("%H:%M:%S")}
     if not rows:
-        return "No data returned."
-    arbs = find_arbs(rows)
-    CACHE = {"rows": rows, "arbs": arbs, "updated": datetime.now().strftime("%H:%M:%S")}
+        return "No data returned from SportyBet or Stake."
     return f"Refreshed: {len(rows)} markets, {len(arbs)} arbitrage opportunities."
 
-def bot_listen(api_key: str, tg_token: str, tg_chat: str):
+def bot_listen(tg_token: str, tg_chat: str):
     start_healthcheck()
-    import requests
     log.info("Interactive bot mode started")
     log.info(f"Bot: @{tg_token.split(':')[0]}")
 
-    # Initial fetch
-    bot_refresh(api_key)
+    init_stake_session()
+    bot_refresh()
     last_update = 0
 
     while True:
@@ -395,7 +450,6 @@ def bot_listen(api_key: str, tg_token: str, tg_chat: str):
                 if not chat_id or not text:
                     continue
 
-                # Responses
                 if text == "/start":
                     tg_send_msg(tg_token, chat_id,
                         "<b>Basketball Arbitrage Bot</b>\n\n"
@@ -405,15 +459,25 @@ def bot_listen(api_key: str, tg_token: str, tg_chat: str):
                         "/stake - Stake odds only\n"
                         "/arb - arbitrage opportunities\n"
                         "/refresh - fetch latest odds\n"
+                        "/status - cache status\n"
                         "/help - this message")
 
                 elif text in ("/help", "/start@"):
                     tg_send_msg(tg_token, chat_id,
                         "/games - all games\n/sportybet - SportyBet odds\n"
-                        "/stake - Stake odds\n/arb - arbitrage\n/refresh - refresh data")
+                        "/stake - Stake odds\n/arb - arbitrage\n/refresh - refresh data\n/status - cache status")
+
+                elif text == "/status":
+                    c = CACHE
+                    tg_send_msg(tg_token, chat_id,
+                        f"<b>Bot Status</b>\n"
+                        f"Markets cached: {len(c['rows'])}\n"
+                        f"Arbitrage: {len(c['arbs'])}\n"
+                        f"Last updated: {c['updated'] or 'never'}\n"
+                        f"Data source: direct scraping (no API key needed)")
 
                 elif text == "/refresh":
-                    result = bot_refresh(api_key)
+                    result = bot_refresh()
                     tg_send_msg(tg_token, chat_id, result)
 
                 elif text == "/games":
@@ -435,11 +499,9 @@ def bot_listen(api_key: str, tg_token: str, tg_chat: str):
 def main():
     global TG_OK
     import argparse
-    ap = argparse.ArgumentParser(description="Basketball odds: SportyBet vs Stake -> Excel + Telegram")
-    ap.add_argument("--api-key", default=API_KEY)
+    ap = argparse.ArgumentParser(description="Basketball odds: SportyBet vs Stake (direct scraping)")
     ap.add_argument("--tg-token", default=TG_TOKEN, help="Telegram bot token")
     ap.add_argument("--tg-chat", default=TG_CHAT_ID, help="Telegram chat ID")
-    ap.add_argument("--sample", action="store_true", help="Demo data, no API key")
     ap.add_argument("--daemon", type=int, default=0, metavar="MIN", help="Push mode: send report every N min")
     ap.add_argument("--once", action="store_true", help="Run once, send to Telegram if configured")
     ap.add_argument("--bot", action="store_true", help="Interactive bot mode (listens for commands)")
@@ -457,46 +519,21 @@ def main():
             print("FAIL: Could not reach Telegram. Check network/firewall.")
         return
 
-    if args.sample:
-        rows = sample_data()
-        buf, arb_count = build_xlsx(rows)
-        arbs = find_arbs(rows)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-        TG_OK = True
-        if args.tg_token and args.tg_chat:
-            tg_send_msg(args.tg_token, args.tg_chat, build_summary(rows, arbs))
-            tg_send_file(args.tg_token, args.tg_chat, buf, f"basketball_odds_{ts}.xlsx",
-                         f"Sample: {len(rows)} markets, {arb_count} arbs")
-        if not args.tg_token or not args.tg_chat or not TG_OK:
-            with open(f"basketball_odds_{ts}.xlsx", "wb") as f:
-                f.write(buf.getvalue())
-            print(f"Sample spreadsheet -> basketball_odds_{ts}.xlsx ({arb_count} arbs)")
-        else:
-            print("Sample report sent to Telegram.")
-        return
-
-    if not args.api_key:
-        print("No API key. Use --sample, or set ODDS_API_KEY env var.")
-        return
-
     if not args.tg_token:
-        print("Telegram bot token required for --daemon, --once, or --bot. Set TG_TOKEN.")
+        print("Telegram bot token required. Set TG_TOKEN env var.")
         return
 
     if args.daemon:
-        daemon_loop(args.api_key, args.tg_token, args.tg_chat, args.daemon)
+        init_stake_session()
+        daemon_loop(args.tg_token, args.tg_chat, args.daemon)
     elif args.once:
-        run_once(args.api_key, args.tg_token, args.tg_chat)
+        init_stake_session()
+        run_once(args.tg_token, args.tg_chat)
     elif args.bot:
-        bot_listen(args.api_key, args.tg_token, args.tg_chat)
+        bot_listen(args.tg_token, args.tg_chat)
     else:
-        # Single run, save locally
-        try:
-            rows = fetch_odds(args.api_key)
-        except RateLimitExceeded:
-            print("\nRate limited (100 req/hr on free tier). Use --sample or wait.")
-            return
+        init_stake_session()
+        rows = fetch_odds()
         if not rows: print("No data."); return
         buf, arb_count = build_xlsx(rows)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
