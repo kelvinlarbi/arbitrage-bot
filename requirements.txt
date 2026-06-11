@@ -1,4 +1,1 @@
-curl_cffi>=0.15
-cloudscraper>=1.2
-openpyxl>=3.0
 requests>=2.28
