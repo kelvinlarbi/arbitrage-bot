@@ -297,6 +297,20 @@ def daemon_loop(api_key: str, tg_token: str, tg_chat: str, interval: int):
 
 CACHE = {"rows": [], "arbs": [], "updated": ""}
 
+def start_healthcheck():
+    """Minimal HTTP server so Railway healthcheck passes."""
+    import http.server, threading
+    PORT = int(os.environ.get("PORT", 8080))
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+        def log_message(self, *a): pass
+    t = threading.Thread(target=lambda: http.server.HTTPServer(("0.0.0.0", PORT), H).serve_forever(), daemon=True)
+    t.start()
+    log.info(f"Healthcheck server on port {PORT}")
+
 def bot_format_games(rows: list[MarketRow]) -> str:
     if not rows: return "No games available."
     lines = ["<b>Available Games</b>\n"]
@@ -357,6 +371,7 @@ def bot_refresh(api_key: str) -> str:
     return f"Refreshed: {len(rows)} markets, {len(arbs)} arbitrage opportunities."
 
 def bot_listen(api_key: str, tg_token: str, tg_chat: str):
+    start_healthcheck()
     import requests
     log.info("Interactive bot mode started")
     log.info(f"Bot: @{tg_token.split(':')[0]}")
