@@ -25,13 +25,19 @@ class MarketRow:
     sb_outcome1: str=""; sb_odds1: float=0; sb_outcome2: str=""; sb_odds2: float=0
     st_outcome1: str=""; st_odds1: float=0; st_outcome2: str=""; st_odds2: float=0
 
-# ── Stake session (cloudscraper bypasses Cloudflare) ──
+# ── Stake session (curl_cffi mimics browser TLS fingerprint) ──
 
+IMPORT_ERR = None
 try:
-    import cloudscraper
-    stake_session = cloudscraper.create_scraper()
-except ImportError:
-    stake_session = requests.Session()
+    from curl_cffi import requests as cr
+    stake_session = cr.Session(impersonate="chrome120")
+except Exception as e:
+    IMPORT_ERR = e
+    try:
+        import cloudscraper
+        stake_session = cloudscraper.create_scraper()
+    except ImportError:
+        stake_session = requests.Session()
 
 stake_session.headers.update({
     "Content-Type": "application/json",
@@ -45,6 +51,11 @@ stake_session.headers.update({
 
 def init_stake_session():
     try:
+        log.info("Initializing Stake session...")
+        r = stake_session.get("https://stake.com/sports/basketball", timeout=20)
+        log.info(f"Stake init: {r.status_code}")
+    except Exception as e:
+        log.warning(f"Stake session init error: {e}")
         log.info("Initializing Stake session...")
         r = stake_session.get("https://stake.com/sports/basketball", timeout=20)
         log.info(f"Stake init: {r.status_code}")
@@ -196,13 +207,17 @@ def fetch_odds() -> list[MarketRow]:
     rows, eid = [], 0
     for key in all_keys:
         s, t = sb.get(key), st.get(key)
-        if not s or not t: continue
+        if not s and not t: continue
         eid += 1
-        rows.append(MarketRow(eid, s["home"], s["away"], "Basketball", "pending",
-            s["market"], "",
-            s["o1n"], s["o1o"], s["o2n"], s["o2o"],
-            t["o1n"], t["o1o"], t["o2n"], t["o2o"]))
-    log.info(f"Merged: {len(rows)} markets (both bookmakers)")
+        s = s or {}
+        t = t or {}
+        rows.append(MarketRow(eid, s.get("home", t.get("home","")), s.get("away", t.get("away","")),
+            "Basketball", "pending",
+            s.get("market", t.get("market","")), "",
+            s.get("o1n",""), s.get("o1o",0), s.get("o2n",""), s.get("o2o",0),
+            t.get("o1n",""), t.get("o1o",0), t.get("o2n",""), t.get("o2o",0)))
+    if rows:
+        log.info(f"Merged: {len(rows)} markets (SB: {len(sb)}, ST: {len(st)})")
     return rows
 
 # ── Arbitrage Finder (works on MarketRow) ────────────
